@@ -1,0 +1,12 @@
+{
+  "repository": "owner/repository",
+  "commit": "replace-with-real-full-commit",
+  "local_path": "/absolute/path/to/checkout",
+  "author": "actual-implementer-id",
+  "version": "actual-version-if-applicable",
+  "build": "actual-build-if-applicable",
+  "compatibility": {
+    "old_clients_supported": false,
+    "evidence": "replace-with-actual-evidence-reference"
+  }
+}

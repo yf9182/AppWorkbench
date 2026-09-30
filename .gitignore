@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+.DS_Store
+.venv/
+dist/
+*.egg-info/
+*.sqlite*
+.env*
+*.p8
+*.p12
+*.key
+state/
+runs/
+artifacts/

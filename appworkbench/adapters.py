@@ -16,12 +16,14 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import sys
 import time
 import tempfile
 import zipfile
 import plistlib
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -135,8 +137,16 @@ def _identifier(value, pattern=r"[A-Za-z0-9_.-]+"):
 
 
 def _ga4(product, root, days):
-    ids = {str(row["ga4_property_id"]) for row in product.get("firebase_ios", []) if row.get("ga4_property_id")}
-    ids.update(str(row["property_id"]) for row in product.get("additional_ga4_properties", []) if row.get("property_id"))
+    identities = {}
+    for row in product.get("firebase_ios", []):
+        if row.get("ga4_property_id"):
+            identities.setdefault(str(row["ga4_property_id"]), []).append({"role": "primary",
+                "repository": row.get("repository"), "firebase_project_id": row.get("project_id"), "bundle_id": row.get("bundle_id")})
+    for row in product.get("additional_ga4_properties", []):
+        if row.get("property_id"):
+            identities.setdefault(str(row["property_id"]), []).append({"role": "secondary",
+                "firebase_project_id": row.get("firebase_project_id")})
+    ids = set(identities)
     if not ids:
         return {"status": "unverified", "reason": "No GA4 property is registered", "properties": []}
     token = _google_token(product, root)
@@ -147,17 +157,23 @@ def _ga4(product, root, days):
             metadata = _json_api("https://analyticsadmin.googleapis.com/v1beta/properties/" + identifier, token)
             if metadata.get("name") != "properties/" + identifier:
                 raise WorkbenchError("identity", "GA4 property identity mismatch")
+            try:
+                today = dt.datetime.now(ZoneInfo(metadata["timeZone"])).date()
+            except (KeyError, ZoneInfoNotFoundError, TypeError):
+                raise WorkbenchError("identity", "GA4 reporting timezone is unavailable") from None
+            start, end = (today - dt.timedelta(days=days)).isoformat(), (today - dt.timedelta(days=1)).isoformat()
             value = _json_api("https://analyticsdata.googleapis.com/v1beta/properties/" + identifier + ":runReport",
-                              token, {"dateRanges": [{"startDate": "%sdaysAgo" % days, "endDate": "yesterday"}],
+                              token, {"dateRanges": [{"startDate": start, "endDate": end}],
                                       "dimensions": [{"name": "date"}, {"name": "appVersion"}],
                                       "metrics": [{"name": "activeUsers"}, {"name": "sessions"},
                                                   {"name": "eventCount"}, {"name": "totalRevenue"}], "limit": 10000})
             results.append({"property_id": identifier, "status": "ready", "timezone": metadata.get("timeZone"),
-                            "currency": metadata.get("currencyCode"), "date_range": {"days": days, "end": "yesterday"},
+                            "currency": metadata.get("currencyCode"), "date_range": {"days": days, "start": start, "end": end},
+                            "source_identity": identities[identifier],
                             "report": value, "has_data": bool(value.get("rows")),
                             "note": "Active users are non-additive; revenue missing rows are unknown, not zero. Event instrumentation needs product validation."})
         except WorkbenchError as error:
-            results.append({"property_id": identifier, "status": "unverified", "reason": error.message})
+            results.append({"property_id": identifier, "source_identity": identities[identifier], "status": "unverified", "reason": error.message})
     return {"status": "ready" if all(r["status"] == "ready" for r in results) else "partial", "properties": results}
 
 
@@ -180,15 +196,52 @@ def _sales(raw, app_id, sku):
     if not required.issubset(set(reader.fieldnames or [])):
         raise WorkbenchError("report", "Apple sales report lacks required columns")
     currencies, matched = {}, 0
+    downloads, download_rows, paid_rows, free_rows = decimal.Decimal(0), 0, 0, 0
+    unknown_currency, unknown_proceeds, ambiguous_parent = 0, 0, 0
     for row in reader:
-        if row.get("Apple Identifier") != app_id and row.get("SKU") != sku and row.get("Parent Identifier") != sku:
+        fields = {key: (value or "").strip() for key, value in row.items() if isinstance(key, str)}
+        app_row = fields.get("Apple Identifier") == app_id or fields.get("SKU") == sku
+        if not app_row and fields.get("Parent Identifier") != sku:
+            # Vendor-wide unattributed rows are NOT attributed to this App. They
+            # only mark the inability to prove that its proceeds coverage is full.
+            kind = fields.get("Product Type Identifier", "")
+            if not fields.get("Parent Identifier") and (kind.startswith("IA") or not kind):
+                ambiguous_parent += 1
             continue
-        currency = row["Currency of Proceeds"]
-        amount = decimal.Decimal(row["Units"]) * decimal.Decimal(row["Developer Proceeds"])
-        currencies[currency] = currencies.get(currency, decimal.Decimal(0)) + amount
         matched += 1
+        try:
+            units = decimal.Decimal(fields["Units"])
+            if not units.is_finite():
+                raise decimal.InvalidOperation()
+        except decimal.InvalidOperation:
+            unknown_proceeds += 1
+            continue
+        if app_row:
+            download_rows += 1
+            downloads += units
+        currency = fields["Currency of Proceeds"].upper()
+        if not re.fullmatch(r"[A-Z]{3}", currency):
+            unknown_currency += 1
+            unknown_proceeds += 1
+            continue
+        try:
+            proceeds = decimal.Decimal(fields["Developer Proceeds"])
+            if not proceeds.is_finite():
+                raise decimal.InvalidOperation()
+        except decimal.InvalidOperation:
+            unknown_proceeds += 1
+            continue
+        amount = units * proceeds
+        paid_rows += int(amount != 0)
+        free_rows += int(amount == 0)
+        currencies[currency] = currencies.get(currency, decimal.Decimal(0)) + amount
+    complete = bool(matched and currencies) and not unknown_proceeds and not ambiguous_parent
     return {"proceeds_by_currency": {key: str(value) for key, value in currencies.items()},
-            "matched_rows": matched, "revenue_known": bool(matched),
+            "matched_rows": matched, "revenue_known": complete, "revenue_coverage": "complete" if complete else "partial" if currencies else "unknown",
+            "app_download_rows": download_rows, "app_download_units": str(downloads) if download_rows else None,
+            "paid_rows": paid_rows, "free_rows": free_rows, "unknown_currency_rows": unknown_currency,
+            "unknown_proceeds_rows": unknown_proceeds, "vendor_ambiguous_parent_rows": ambiguous_parent,
+            "source_app_filter": {"app_id": app_id, "sku": sku},
             "sha256": hashlib.sha256(raw).hexdigest(), "metric": "units * developer proceeds; not gross revenue"}
 
 
@@ -362,8 +415,12 @@ def inspect_product(product, root):
                 continue
             if action == "deploy" and target.get("kind") not in ("web", "worker"):
                 continue
+            value = target.get(field)
+            commands = [row.get("argv", []) for row in value] if field == "checks" and value else [value] if value else []
+            missing = any(not argv or not shutil.which(argv[0]) for argv in commands)
             checks.append({"capability": action, "target": target.get("id"),
-                           "status": "unverified", "reason": "Configured; execution not tested" if target.get(field) else "Entry point not configured",
+                           "status": "blocked" if missing else "unverified",
+                           "reason": "Required command executable unavailable" if missing else "Configured; execution not tested" if value else "Entry point not configured",
                            "checked_at": now()})
     for note in product.get("readiness_notes", []):
         checks.append({"capability": "product_readiness", "target": product["id"], "status": "unverified",
@@ -494,7 +551,8 @@ def execute_action(action, product, root, target, candidate, parameters):
         config = _wrangler_identity(path, target)
         # Force a single, verified Wrangler target; shell/npm aliases could deploy elsewhere.
         argv = _configured_command(target, "deploy_argv")
-        if argv[:2] != ["wrangler", "deploy"] and argv[:4] != ["npx", "--no-install", "wrangler", "deploy"]:
+        if (argv[:2] != ["wrangler", "deploy"] and argv[:4] != ["npx", "--no-install", "wrangler", "deploy"]
+                and argv[:4] != ["pnpm", "exec", "wrangler", "deploy"]):
             raise WorkbenchError("configuration", "Worker deploy must use explicit wrangler deploy")
         prefix = 2 if argv[0] == "wrangler" else 4
         tail = argv[prefix:]
@@ -553,35 +611,60 @@ def execute_action(action, product, root, target, candidate, parameters):
         argv = _configured_command(target, "archive_argv")
         if argv[0] != "xcodebuild" or "archive" not in argv:
             raise WorkbenchError("configuration", "Archive must use explicit xcodebuild archive")
+        def argument(command, flag):
+            if command.count(flag) != 1 or command.index(flag) + 1 >= len(command):
+                raise WorkbenchError("configuration", "Archive arguments need unique registered identity and output paths")
+            return command[command.index(flag)+1]
+        flag = "-workspace" if target.get("workspace") else "-project"
+        other = "-project" if flag == "-workspace" else "-workspace"
+        project = target.get("workspace") or target.get("project")
+        expected_project = (path / (project or "/nonexistent")).resolve()
+        if (not project or not expected_project.is_relative_to(path) or not expected_project.exists()
+                or other in argv or (path / argument(argv, flag)).resolve() != expected_project
+                or argument(argv, "-scheme") != target.get("scheme")):
+            raise WorkbenchError("identity", "Archive project and scheme must belong to the committed candidate")
+        base_archive = (path / target.get("archive_path", "/nonexistent")).absolute()
+        if (path / argument(argv, "-archivePath")).absolute() != base_archive:
+            raise WorkbenchError("identity", "Archive command output differs from the registered archive")
+        suffix = _identifier(parameters.get("archive_suffix", ""))
+        archive = base_archive.with_name(base_archive.stem + "-" + suffix + ".xcarchive")
+        if archive.exists() or archive.is_symlink() or any(p.is_symlink() for p in archive.parents):
+            raise WorkbenchError("artifact", "Archive must be a fresh output with no symlink parents")
+        archive.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        argv[argv.index("-archivePath")+1] = str(archive)
         result = _run(argv, path, timeout=target.get("archive_timeout", 1800))
-        archive = target.get("archive_path")
-        if result["status"] == "succeeded" and archive:
-            archive = (path / archive).resolve()
+        if result["status"] == "succeeded":
             info = archive / "Info.plist"
-            import plistlib
             try:
                 identity = plistlib.loads(info.read_bytes())["ApplicationProperties"]
                 if (identity.get("CFBundleIdentifier") != target.get("bundle_id")
                         or str(identity.get("CFBundleShortVersionString")) != str(candidate.get("version"))
                         or str(identity.get("CFBundleVersion")) != str(candidate.get("build"))):
                     raise ValueError()
-                result["evidence"] = {"archive_path": str(archive), "info_sha256": sha256_file(info),
+                result["evidence"] = {"commit": candidate["commit"], "archive_path": str(archive), "info_sha256": sha256_file(info),
                                       "bundle_id": identity["CFBundleIdentifier"], "version": identity.get("CFBundleShortVersionString"), "build": identity.get("CFBundleVersion")}
             except (OSError, ValueError, KeyError):
-                result.update(status="failed", reason="Archive product identity could not be verified")
-        elif result["status"] == "succeeded":
-            result.update(status="unverified", reason="Archive path is not registered")
+                result.update(status="failed", reason="Fresh archive product identity could not be verified")
         if result["status"] == "succeeded" and target.get("export_argv"):
             argv = _configured_command(target, "export_argv")
             if argv[0] != "xcodebuild" or "-exportArchive" not in argv:
                 raise WorkbenchError("configuration", "IPA export must use explicit xcodebuild -exportArchive")
-            if "-archivePath" not in argv or (path / argv[argv.index("-archivePath") + 1]).resolve() != archive:
-                raise WorkbenchError("identity", "IPA export must reference the verified archive")
+            if (path / argument(argv, "-archivePath")).absolute() != base_archive:
+                raise WorkbenchError("identity", "IPA export must reference the registered archive")
+            base_ipa = (path / target.get("ipa_path", "/nonexistent")).absolute()
+            base_export = (path / argument(argv, "-exportPath")).absolute()
+            if base_ipa.parent != base_export:
+                raise WorkbenchError("identity", "IPA path must belong to the registered export directory")
+            export = base_export.with_name(base_export.name + "-" + suffix)
+            if export.exists() or export.is_symlink() or any(p.is_symlink() for p in export.parents):
+                raise WorkbenchError("artifact", "IPA export must use a fresh output directory")
+            argv[argv.index("-archivePath")+1] = str(archive)
+            argv[argv.index("-exportPath")+1] = str(export)
             exported = _run(argv, path, timeout=target.get("export_timeout", 900))
             result["evidence"]["export"] = _safe_result(exported)
-            ipa = (path / target.get("ipa_path", "/nonexistent")).resolve()
-            if exported["status"] != "succeeded" or not ipa.is_file():
-                result.update(status="unverified", reason="Signed IPA export failed or its path is not registered")
+            ipa = export / base_ipa.name
+            if exported["status"] != "succeeded" or not ipa.is_file() or ipa.is_symlink():
+                result.update(status="failed", reason="Fresh signed IPA export failed")
             else:
                 actual = _inspect_ipa(ipa)
                 expected = {"bundle_id": target.get("bundle_id"), "team_id": target.get("team_id"),
@@ -884,7 +967,7 @@ def _prepare_store(product, root, target, candidate, token, parameters):
 
 
 def _reconcile(product, root, target, candidate, parameters):
-    previous = parameters.get("action") or parameters.get("original_action")
+    previous = parameters.get("original_action") or parameters.get("action")
     if previous == "prepare_store":
         token, _ = _apple_token(product, root)
         _apple_identity(token, str(target.get("app_id", "")), target.get("bundle_id"))
@@ -919,6 +1002,15 @@ def _reconcile(product, root, target, candidate, parameters):
                     "authenticated": True, "evidence": {"authenticated_remote": True, **value}}
         except (ValueError, KeyError):
             return {"status": "unverified", "reason": "PR remote evidence is unavailable"}
+    if previous == "smoke":
+        active = _reconcile(product, root, target, candidate, {"original_action": "deploy"})
+        if active.get("status") != "succeeded" or active.get("authenticated") is not True:
+            return {"status": "unverified", "reason": "Candidate is not authenticated as active on the registered Worker"}
+        result = execute_action("smoke", product, root, target, candidate, {})
+        if result.get("status") in {"succeeded", "failed"}:
+            result["authenticated"] = True
+            result["evidence"]["deployment"] = active["evidence"]
+        return result
     if previous == "deploy":
         values = _worker_versions(product, root, target)
         matching = [v for v in values if v.get("annotations", {}).get("workers/message") == "AppWorkbench candidate " + candidate["commit"]]

@@ -15,6 +15,11 @@ from .store import Store
 ACTIONS = {'pr', 'merge', 'deploy', 'smoke', 'rollback', 'archive', 'upload_tf', 'prepare_store'}
 ACCEPTANCE_NAMES = {'installation': 'device_install', 'core_paths': 'core_path', 'existing_rights': 'existing_entitlements', 'metadata': 'metadata_review'}
 
+def code_binding(candidate):
+    value = copy.deepcopy(candidate)
+    value.pop('artifact', None)
+    return digest(value)
+
 class Engine:
     def __init__(self, root, adapter=None):
         self.root = Path(root).expanduser().resolve()
@@ -87,6 +92,11 @@ class Engine:
             raise WorkbenchError('plan_unapproved', 'This exact plan revision needs a real human confirmation')
         if sha256_file(confined(self.root, run['plan_path'])) != run['plan_sha256']:
             raise WorkbenchError('plan_changed', 'Approved plan document changed')
+        if run.get('phase') == 'accepted':
+            raise WorkbenchError('iteration_complete', 'Accepted iteration needs new actual defect feedback or a new plan before further implementation')
+        owner = self.store.db.execute('SELECT run FROM owners WHERE product=?', (run['product'],)).fetchone()
+        if not owner or owner[0] != run['id']:
+            raise WorkbenchError('product_owned', 'This iteration does not own product execution')
         product = self.registry.get(run['product'])
         self.registry.validate(product)
         if configuration_digest(product) != run['configuration_sha256']:
@@ -191,10 +201,13 @@ class Engine:
             value['repository'] = repo['name']
             old = run['candidates'].get(repo['name'])
             if old != value:
-                run['reviews'].pop(repo['name'], None)
+                changed_code = not old or code_binding(old) != code_binding(value)
+                if changed_code:
+                    run['reviews'].pop(repo['name'], None)
                 for target in product['workflow']['targets']:
                     if target['repository'] == repo['name']:
-                        run['checks'].pop(target['id'], None)
+                        if changed_code:
+                            run['checks'].pop(target['id'], None)
                         run['acceptances'].pop(target['id'], None)
             run['candidates'][repo['name']] = value
             run['phase'] = 'implementing'
@@ -221,8 +234,8 @@ class Engine:
             if status == 'passed' and any(f.get('severity', f.get('priority')) in {'blocking', 'critical', 'high', 'P0', 'P1', 0, 1} for f in value.get('findings', []) if isinstance(f, dict)):
                 raise WorkbenchError('review_blocking_findings', 'Blocking findings cannot be recorded as passed')
             self._workspace(product, candidate)
-            reference = self._evidence(run, 'independent_review', value=value, binding={'repository': repo['name'], 'commit': candidate['commit'], 'candidate_sha256': digest(candidate)})
-            run['reviews'][repo['name']] = {'status': status, 'reviewer': reviewer, 'commit': candidate['commit'], 'candidate_sha256': digest(candidate), 'evidence': reference}
+            reference = self._evidence(run, 'independent_review', value=value, binding={'repository': repo['name'], 'commit': candidate['commit'], 'candidate_sha256': code_binding(candidate)})
+            run['reviews'][repo['name']] = {'status': status, 'reviewer': reviewer, 'commit': candidate['commit'], 'candidate_sha256': code_binding(candidate), 'evidence': reference}
             self.store.put(run)
             self.store.audit(run_id, 'review_recorded', {'repository': repo['name'], 'status': status, 'reviewer': reviewer})
         self.report(run_id)
@@ -250,8 +263,8 @@ class Engine:
                 status = 'passed' if outcome.get('status') == 'succeeded' else 'failed' if outcome.get('status') == 'failed' else 'unverified'
                 with self.store.transaction():
                     run = self.store.get(run_id)
-                    reference = self._evidence(run, 'check:' + check['id'], value=outcome, binding={'commit': candidate['commit'], 'target': target_id, 'candidate_sha256': digest(candidate)})
-                    record = {'name': check['id'], 'status': status, 'commit': candidate['commit'], 'candidate_sha256': digest(candidate), 'configuration_sha256': run['configuration_sha256'], 'evidence': reference}
+                    reference = self._evidence(run, 'check:' + check['id'], value=outcome, binding={'commit': candidate['commit'], 'target': target_id, 'candidate_sha256': code_binding(candidate)})
+                    record = {'name': check['id'], 'status': status, 'commit': candidate['commit'], 'candidate_sha256': code_binding(candidate), 'configuration_sha256': run['configuration_sha256'], 'evidence': reference}
                     run['checks'].setdefault(target_id, {})[check['id']] = record
                     self.store.put(run)
                     self.store.audit(run_id, 'check_completed', {'target': target_id, 'name': check['id'], 'status': status})
@@ -269,7 +282,7 @@ class Engine:
             raise WorkbenchError('candidate_missing', 'Target has no committed candidate')
         self._workspace(product, candidate)
         review = run['reviews'].get(target['repository'], {})
-        if review.get('status') != 'passed' or review.get('candidate_sha256') != digest(candidate):
+        if review.get('status') != 'passed' or review.get('candidate_sha256') != code_binding(candidate):
             raise WorkbenchError('review_required', 'Current candidate needs independent passing review')
         self._verify_evidence(review['evidence'])
         required = target.get('required_checks', [])
@@ -277,7 +290,7 @@ class Engine:
             raise WorkbenchError('checks_unconfigured', 'Release needs explicitly configured acceptance checks')
         for check_name in required:
             record = run['checks'].get(target['id'], {}).get(check_name, {})
-            if record.get('status') != 'passed' or record.get('candidate_sha256') != digest(candidate) or record.get('configuration_sha256') != run['configuration_sha256']:
+            if record.get('status') != 'passed' or record.get('candidate_sha256') != code_binding(candidate) or record.get('configuration_sha256') != run['configuration_sha256']:
                 raise WorkbenchError('check_required', 'Current candidate has missing or failed required checks')
             self._verify_evidence(record['evidence'])
         if target.get('compatibility_required'):
@@ -298,15 +311,23 @@ class Engine:
                     if not ref:
                         raise WorkbenchError('dependency_unverified', 'Out-of-scope dependency needs actual compatibility evidence')
                     self._verify_evidence(ref)
-        current_actions = [a for a in self.store.actions(run['id']) if a.get('candidate_sha256') == digest(candidate) and a['target'] == target['id'] and a['status'] == 'succeeded']
+        current_actions = [a for a in self.store.actions(run['id']) if a.get('candidate_sha256') == digest(candidate) and a['target'] == target['id'] and a['status'] == 'succeeded' and a.get('configuration_sha256') == run['configuration_sha256'] and a.get('plan_sha256') == run['plan_sha256']]
+        for record in current_actions:
+            self._action_evidence(record)
         if action == 'merge' and not any(a['kind'] == 'pr' for a in current_actions):
             raise WorkbenchError('pr_required', 'Create a candidate-bound PR before merging')
         if action == 'deploy' and not any(a['kind'] == 'merge' for a in current_actions):
             raise WorkbenchError('merge_required', 'Merge the reviewed candidate before deployment')
         if action in {'smoke', 'rollback'} and not any(a['kind'] == 'deploy' for a in current_actions):
             raise WorkbenchError('deploy_required', 'There is no recorded deployment to validate or roll back')
-        if action == 'upload_tf' and not candidate.get('artifact'):
-            raise WorkbenchError('artifact_required', 'Register the actual IPA digest before upload')
+        if action == 'upload_tf':
+            if not candidate.get('artifact'):
+                raise WorkbenchError('artifact_required', 'Register the actual IPA digest before upload')
+            archives = [a for a in self.store.actions(run['id']) if a['kind'] == 'archive' and a['target'] == target['id'] and a['status'] == 'succeeded' and a.get('candidate', {}).get('commit') == candidate['commit'] and a.get('configuration_sha256') == run['configuration_sha256'] and a.get('plan_sha256') == run['plan_sha256']]
+            archive = next((a for a in archives if a.get('outcome', {}).get('evidence', {}).get('artifact', {}).get('sha256') == candidate['artifact']['sha256']), None)
+            if not archive:
+                raise WorkbenchError('archive_required', 'Upload needs an actual archive/export at this commit with the exact IPA digest')
+            self._action_evidence(archive)
         if action == 'deploy' and target.get('rollback_policy') != 'previous_active_version':
             raise WorkbenchError('rollback_unconfigured', 'Deployment requires a configured previous-version rollback policy')
         if action == 'prepare_store':
@@ -318,22 +339,34 @@ class Engine:
             self._verify_evidence(acceptance['evidence'])
         return candidate
 
+    def _action_evidence(self, record):
+        if not record.get('evidence'):
+            raise WorkbenchError('evidence_missing', 'Completed external action needs actual recorded evidence')
+        self._verify_evidence(record['evidence'])
+        if record.get('reconciliation_evidence'):
+            self._verify_evidence(record['reconciliation_evidence'])
+
     def _delivered(self, run, target):
         candidate = run['candidates'].get(target['repository'])
         if not candidate:
             return False
         kinds = {'upload_tf'} if target['kind'] == 'ios' else {'smoke'}
         actions = self.store.actions(run['id'])
-        relevant = [a for a in actions if a['target'] == target['id'] and a.get('candidate_sha256') == digest(candidate)]
+        relevant = [a for a in actions if a['target'] == target['id'] and a.get('candidate_sha256') == digest(candidate) and a.get('configuration_sha256') == run['configuration_sha256'] and a.get('plan_sha256') == run['plan_sha256']]
         if any(a['kind'] == 'rollback' and a['status'] in {'running', 'uncertain', 'succeeded'} for a in relevant):
             return False
-        return any(a['kind'] in kinds and a['status'] == 'succeeded' for a in relevant)
+        delivered = [a for a in relevant if a['kind'] in kinds and a['status'] == 'succeeded']
+        for record in delivered:
+            self._action_evidence(record)
+        return bool(delivered)
 
     def deliver(self, run_id, target_id, action, parameters=None):
         if action not in ACTIONS:
             raise WorkbenchError('action_forbidden', 'Unknown or forbidden external action; App Store submit/release is never supported')
         parameters = parameters or {}
         scan_sensitive(parameters)
+        if {'action', 'original_action', 'original', 'deployment_preflight', 'rollback_version_id', 'authenticated', 'archive_suffix'} & set(parameters):
+            raise WorkbenchError('parameters_reserved', 'Recovery and authorization fields are reserved for persisted engine intents')
         with self.store.lock('iteration:' + run_id):
             run = self.store.get(run_id)
             product = self._approved(run)
@@ -346,7 +379,9 @@ class Engine:
                 if existing and existing['run'] != run_id:
                     raise WorkbenchError('prior_iteration_action', 'This candidate has an action in another iteration; query and reconcile that iteration before reuse')
                 if existing and existing['status'] == 'succeeded':
-                    self._verify_evidence(existing['evidence'])
+                    if existing.get('configuration_sha256') != run['configuration_sha256'] or existing.get('plan_sha256') != run['plan_sha256']:
+                        raise WorkbenchError('prior_revision_action', 'Historical delivery is bound to a different configuration or plan; use a new candidate or explicitly verify the earlier iteration')
+                    self._action_evidence(existing)
                     return {**existing, 'deduplicated': True}
                 if existing and existing['status'] in {'running', 'uncertain'}:
                     raise WorkbenchError('action_uncertain', 'Reconcile the previous intent remotely before another dispatch')
@@ -361,6 +396,8 @@ class Engine:
                     if not recorded or recorded != parameters.get('metadata_sha256'):
                         raise WorkbenchError('metadata_acceptance_required', 'The actual human metadata review must bind the exact metadata file digest')
                 item = existing or {'id': uuid.uuid4().hex, 'run': run_id, 'target': target_id, 'kind': action, 'dedup': key, 'created_at': now(), 'attempts': 0}
+                if action == 'archive':
+                    parameters = {**parameters, 'archive_suffix': item['id'] + '-' + str(item['attempts'] + 1)}
                 item.update({'status': 'running', 'pid': os.getpid(), 'candidate_sha256': digest(candidate), 'candidate': candidate, 'target_snapshot': target, 'configuration_sha256': run['configuration_sha256'], 'plan_sha256': run['plan_sha256'], 'parameters': parameters, 'attempts': item['attempts'] + 1, 'started_at': now()})
                 with self.store.transaction():
                     self.store.put_action(item)
@@ -406,11 +443,16 @@ class Engine:
                 except ProcessLookupError:
                     pass
             product = self.registry.get(run['product'])
-            outcome = safe_json(self.adapter.execute_action('reconcile', product, self.root, item['target_snapshot'], item['candidate'], {'original_action': item['kind'], 'original': item, **item.get('parameters', {})}))
+            if item['kind'] == 'archive':
+                outcome = {'status': 'failed', 'authenticated': True, 'local_only': True, 'reason': 'Interrupted local archive has no verified completion; retry creates fresh archive and export outputs'}
+            else:
+                outcome = safe_json(self.adapter.execute_action('reconcile', product, self.root, item['target_snapshot'], item['candidate'], {**{k:v for k,v in item.get('parameters', {}).items() if k not in {'action', 'original_action', 'original'}}, 'original_action': item['kind'], 'original': item}))
             if outcome.get('status') not in {'succeeded', 'failed'} or outcome.get('authenticated') is not True:
                 raise WorkbenchError('reconciliation_unverified', 'Remote evidence did not establish an authenticated terminal result')
             with self.store.transaction():
                 reference = self._evidence(run, 'remote_reconciliation', value=outcome, binding={'action': action_id, 'commit': item['candidate']['commit']})
+                if not item.get('evidence'):
+                    item['evidence'] = reference
                 item.update({'status': outcome['status'], 'reconciliation': outcome, 'reconciliation_evidence': reference, 'reconciled_at': now()})
                 self.store.put_action(item)
                 self.store.put(run)
@@ -444,6 +486,8 @@ class Engine:
             status = value.get('status')
             if status not in {'passed', 'issues', 'pending'}:
                 raise WorkbenchError('acceptance_invalid', 'Acceptance is passed, issues or pending')
+            if run.get('phase') == 'accepted' and status == 'issues':
+                self.store.claim(run)
             checks = {ACCEPTANCE_NAMES.get(k, k): v for k, v in value.get('checks', {}).items()}
             if status == 'passed':
                 if not self._delivered(run, target):

@@ -85,7 +85,7 @@ def backup(root, output, key_file):
                 target.close(); source.close()
             os.chmod(snapshot, 0o600)
             files.append(('state/workbench.sqlite', snapshot))
-        for directory in ('runs',):
+        for directory in ('runs', 'assessments'):
             folder = confined(root, directory)
             if folder.exists():
                 for path in sorted(folder.rglob('*')):
@@ -113,7 +113,7 @@ def backup(root, output, key_file):
     return {'archive': str(output), 'key_file': str(key_file), 'files': len(files), 'sha256': sha256_file(output), 'credentials_included': False}
 
 
-def restore(input, key_file, destination):
+def restore(input, key_file, destination, credential_home=None):
     source, destination = _plain_path(input), _new_path(destination)
     if not source.is_file() or source.stat().st_size > MAX_BYTES + 1024 * 1024:
         raise WorkbenchError('archive_invalid', 'Expected a bounded encrypted archive')
@@ -137,7 +137,7 @@ def restore(input, key_file, destination):
                 mode = info.external_attr >> 16
                 if name.is_absolute() or '..' in name.parts or '\\' in info.filename or info.filename in names or (mode & 0o170000) == 0o120000:
                     raise ValueError()
-                if str(name) != info.filename or not name.parts or (name.parts[0] not in {'products.json', 'state', 'runs', 'MIGRATION.md', 'migration.json'}):
+                if str(name) != info.filename or not name.parts or (name.parts[0] not in {'products.json', 'state', 'runs', 'assessments', 'MIGRATION.md', 'migration.json'}):
                     raise ValueError()
                 if name.parts[0] in {'products.json', 'MIGRATION.md', 'migration.json'} and len(name.parts) != 1:
                     raise ValueError()
@@ -155,6 +155,8 @@ def restore(input, key_file, destination):
     try:
         for name, value in contents:
             private_write(confined(staging, name), value)
+        if credential_home is not None:
+            _attach_credentials(credential_home, staging, destination)
         db = staging / 'state/workbench.sqlite'
         if db.exists():
             connection = sqlite3.connect(db.as_uri() + '?mode=ro', uri=True)
@@ -169,4 +171,38 @@ def restore(input, key_file, destination):
     finally:
         if staging.exists():
             shutil.rmtree(staging)
-    return {'destination': str(destination), 'files': len(contents), 'credentials_included': False, 'revalidation_required': ['repository_paths', 'credentials', 'platform_sessions', 'signing', 'remote_actions'], 'instructions': str(destination / 'MIGRATION.md')}
+    return {'destination': str(destination), 'files': len(contents), 'credentials_included': credential_home is not None, 'revalidation_required': ['repository_paths', 'credentials', 'platform_sessions', 'signing', 'remote_actions'], 'instructions': str(destination / 'MIGRATION.md')}
+
+
+def _attach_credentials(source, staging, destination):
+    """Merge the separately restored credential bundle, never its products/state."""
+    source = _plain_path(source)
+    manifest = read_json(confined(source, 'manifest.json'))
+    credentials = manifest.get('credentials')
+    if not isinstance(credentials, dict):
+        raise WorkbenchError('credential_bundle_invalid', 'Expected an existing credential-center restore')
+    for item in credentials.values():
+        for name in ('file', 'metadata_file'):
+            if item.get(name):
+                path = confined(source, item[name])
+                if not path.is_file() or path.stat().st_mode & 0o077:
+                    raise WorkbenchError('credential_bundle_invalid', 'Credential files must exist and be private')
+    files = [('manifest.json', confined(source, 'manifest.json'))]
+    for folder in ('secrets', 'signing', 'scripts', 'migration'):
+        directory = confined(source, folder)
+        if directory.exists():
+            for path in sorted(directory.rglob('*')):
+                confined(source, str(path.relative_to(source)))
+                if path.is_file() and '__pycache__' not in path.parts:
+                    files.append((path.relative_to(source).as_posix(), path))
+    if len(files) > 1000 or sum(p.stat().st_size for _, p in files) > MAX_BYTES:
+        raise WorkbenchError('credential_bundle_invalid', 'Credential bundle exceeds migration bounds')
+    for name, path in files:
+        value = path.read_bytes()
+        if name.endswith(('.json', '.md')):
+            value = value.replace(str(source).encode(), str(destination).encode())
+        target = confined(staging, name)
+        if target.exists():
+            raise WorkbenchError('credential_bundle_invalid', 'Credential merge cannot overwrite state files')
+        private_write(target, value)
+        if name == 'scripts/wb-credentials':target.chmod(0o700)

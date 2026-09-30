@@ -38,6 +38,16 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual((dest/'state/workbench.sqlite').stat().st_mode & 0o777,0o600)
         self.assertEqual(dest.stat().st_mode & 0o777,0o700)
         with self.assertRaises(WorkbenchError): migration.restore(a,k,dest)
+    def test_restore_can_merge_separate_credentials_without_overwriting_products(self):
+        a,k=self.pack();credentials=self.base/'credentials';credentials.mkdir();(credentials/'secrets').mkdir();token=credentials/'secrets/provider.txt';token.write_text('test-value-for-private-transfer');token.chmod(0o600)
+        write_json(credentials/'manifest.json',{'credentials':{'test':{'file':'secrets/provider.txt'}}});write_json(credentials/'products.json',{'products':[]})
+        result=migration.restore(a,k,self.base/'merged',credentials);self.assertTrue(result['credentials_included']);self.assertEqual((self.base/'merged/secrets/provider.txt').read_bytes(),token.read_bytes());self.assertEqual(json.loads((self.base/'merged/products.json').read_text())['products'][0]['id'],'p')
+        token.chmod(0o644)
+        with self.assertRaises(WorkbenchError):migration.restore(a,k,self.base/'invalid-merge',credentials)
+        self.assertFalse((self.base/'invalid-merge').exists())
+    def test_assessment_reports_are_migrated_without_raw_dashboard_projection(self):
+        write_json(self.root/'assessments/p/snapshot/data.json',{'sources':[{'source':'ga4','status':'partial','checked_at':'time','data':{'raw':'private-metric'}}]})
+        a,k=self.pack();dest=self.base/'restored-reports';migration.restore(a,k,dest);self.assertTrue((dest/'assessments/p/snapshot/data.json').is_file());projection=dashboard.projection(dest);self.assertEqual(projection['products'][0]['data_sources'][0]['status'],'partial');self.assertNotIn('private-metric',json.dumps(projection))
     def test_tamper_wrong_key_and_symlink(self):
         a,k=self.pack(); original=a.read_bytes(); data=bytearray(original); data[-1]^=1; a.write_bytes(data)
         with self.assertRaises(WorkbenchError): migration.restore(a,k,self.base/'tampered')

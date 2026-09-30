@@ -86,7 +86,7 @@ class Registry:
                     raise WorkbenchError('dependency_invalid', 'Target dependency is invalid')
             if target.get('kind') == 'ios':
                 apps = product.get('app_store_apps', [])
-                if apps and not any(str(a['app_store_id']) == str(target.get('app_id')) and a['bundle_id'] == target.get('bundle_id') for a in apps):
+                if not apps or not any(str(a['app_store_id']) == str(target.get('app_id')) and a['bundle_id'] == target.get('bundle_id') for a in apps):
                     raise WorkbenchError('identity_mismatch', 'iOS target must match its registered App Store identity')
             if target.get('worker_name'):
                 workers = product.get('cloudflare_workers', [])
@@ -127,7 +127,7 @@ class Registry:
             targets = []
             for worker in product.get('cloudflare_workers', []):
                 name = worker['repository']
-                targets.append({'id': name.lower() if sum(w['repository'] == name for w in product.get('cloudflare_workers', [])) == 1 else worker['worker_name'], 'repository': name, 'kind': 'worker', 'worker_name': worker['worker_name'], 'account_id': worker['account_id'], 'wrangler_config': worker.get('source_configuration', 'wrangler.jsonc'), 'checks': [], 'required_checks': [], 'depends_on': [], 'deploy_argv': ['npx', '--no-install', 'wrangler', 'deploy'], 'rollback_policy': 'previous_active_version', 'smoke_url': 'https://' + worker['worker_name'] + '.yangf999212.workers.dev/'})
+                targets.append({'id': name.lower() if sum(w['repository'] == name for w in product.get('cloudflare_workers', [])) == 1 else worker['worker_name'], 'repository': name, 'kind': 'worker', 'worker_name': worker['worker_name'], 'account_id': worker['account_id'], 'wrangler_config': worker.get('source_configuration', 'wrangler.jsonc'), 'checks': [], 'required_checks': [], 'depends_on': [], 'deploy_argv': ['pnpm', 'exec', 'wrangler', 'deploy'], 'rollback_policy': 'previous_active_version', 'smoke_url': 'https://' + worker['worker_name'] + '.yangf999212.workers.dev/'})
             for app in product.get('app_store_apps', []):
                 ios = next((x['repository'] for x in product.get('firebase_ios', []) if x['bundle_id'] == app['bundle_id']), product['repositories'][0]['name'])
                 targets.append({'id': ios.lower(), 'repository': ios, 'kind': 'ios', 'app_id': str(app['app_store_id']), 'bundle_id': app['bundle_id'], 'team_id': 'Z3YH9HL8H3', 'checks': [], 'required_checks': [], 'depends_on': []})
@@ -144,9 +144,9 @@ class Registry:
                 for target in targets:
                     name = target['repository']
                     if name == 'AIPetStudio-Backend':
-                        target.update({'checks': [{'id': 'tests', 'argv': ['npm', 'test'], 'timeout': 300}], 'required_checks': ['tests'], 'smoke_url': 'https://ai-pet-studio-backend.yangf999212.workers.dev/healthz', 'compatibility_required': True})
+                        target.update({'checks': [{'id': 'typecheck', 'argv': ['pnpm', 'exec', 'tsc', '--noEmit'], 'timeout': 180}, {'id': 'webhook', 'argv': ['node', 'scripts/test-revenuecat-webhook.mjs'], 'timeout': 180}, {'id': 'pet-translator', 'argv': ['node', 'scripts/test-pet-translator.mjs'], 'timeout': 180}], 'required_checks': ['typecheck', 'webhook', 'pet-translator'], 'smoke_url': 'https://ai-pet-studio-backend.yangf999212.workers.dev/healthz', 'compatibility_required': True})
                     elif name == 'AIPetStudio-Web':
-                        target.update({'kind': 'web', 'checks': [{'id': 'typecheck', 'argv': ['npm', 'run', 'typecheck'], 'timeout': 180}, {'id': 'lint', 'argv': ['npm', 'run', 'lint'], 'timeout': 180}, {'id': 'build', 'argv': ['npx', '--no-install', 'opennextjs-cloudflare', 'build'], 'timeout': 600}], 'required_checks': ['typecheck', 'lint', 'build'], 'depends_on': [backend]})
+                        target.update({'kind': 'web', 'checks': [{'id': 'typecheck', 'argv': ['pnpm', 'run', 'typecheck'], 'timeout': 180}, {'id': 'lint', 'argv': ['pnpm', 'run', 'lint'], 'timeout': 180}, {'id': 'build', 'argv': ['pnpm', 'exec', 'opennextjs-cloudflare', 'build'], 'timeout': 600}], 'required_checks': ['typecheck', 'lint', 'build'], 'depends_on': [backend]})
                     else:
                         target.update({'project': 'AIPetStudio.xcodeproj', 'scheme': 'AIPetStudio', 'checks': [{'id': 'build', 'argv': ['xcodebuild', '-project', 'AIPetStudio.xcodeproj', '-scheme', 'AIPetStudio', '-destination', 'generic/platform=iOS Simulator', 'CODE_SIGNING_ALLOWED=NO', 'build'], 'timeout': 900}], 'required_checks': ['build'], 'depends_on': [backend], 'human_acceptances': ['device_install', 'core_path', 'purchase', 'restore', 'existing_entitlements', 'metadata_review']})
                 product['workflow']['shared_services'] = ['material-hub']

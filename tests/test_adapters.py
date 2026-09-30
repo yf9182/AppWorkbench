@@ -14,7 +14,7 @@ class AdapterTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
-        self.root = Path(self.temporary.name)
+        self.root = Path(self.temporary.name).resolve()
         self.checkout = self.root / "checkout"
         self.checkout.mkdir()
         for args in (["git", "init", "-q"], ["git", "config", "user.name", "Fixture"],
@@ -33,6 +33,42 @@ class AdapterTests(unittest.TestCase):
             {"name": "app", "owner": "fixture", "local_path": str(self.checkout)}]}
         self.candidate = {"repository": "app", "commit": self.commit, "local_path": str(self.checkout)}
 
+    def test_archive_uses_new_paths_and_exports_the_new_archive(self):
+        import plistlib
+        (self.checkout/'App.xcodeproj').mkdir();stale=self.root/'base.xcarchive';stale.mkdir();(stale/'Info.plist').write_bytes(b'stale')
+        target=dict(self.target,kind='ios',project='App.xcodeproj',scheme='App',bundle_id='com.fixture.App',team_id='TEAM',archive_path=str(stale),ipa_path=str(self.root/'ipa/App.ipa'),archive_argv=['xcodebuild','-project','App.xcodeproj','-scheme','App','-archivePath',str(stale),'archive'],export_argv=['xcodebuild','-exportArchive','-archivePath',str(stale),'-exportPath',str(self.root/'ipa')])
+        candidate=dict(self.candidate,version='1.0',build='1');seen=[]
+        def execute(argv,*args,**kwargs):
+            seen.append(argv.copy())
+            if 'archive' in argv:
+                archive=Path(argv[argv.index('-archivePath')+1]);archive.mkdir();(archive/'Info.plist').write_bytes(plistlib.dumps({'ApplicationProperties':{'CFBundleIdentifier':'com.fixture.App','CFBundleShortVersionString':'1.0','CFBundleVersion':'1'}}))
+            else:
+                output=Path(argv[argv.index('-exportPath')+1]);output.mkdir();(output/'App.ipa').write_bytes(b'newly-exported-candidate')
+            return {'status':'succeeded'}
+        with patch.object(a,'_repository',return_value=(self.checkout,'fixture/app')),patch.object(a,'_run',side_effect=execute),patch.object(a,'_inspect_ipa',return_value={'bundle_id':'com.fixture.App','team_id':'TEAM','version':'1.0','build':'1'}):
+            result=a.execute_action('archive',self.product,self.root,target,candidate,{'archive_suffix':'intent-1'})
+        self.assertEqual(result['status'],'succeeded');self.assertEqual(seen[0][seen[0].index('-archivePath')+1],seen[1][seen[1].index('-archivePath')+1]);self.assertNotEqual(seen[0][seen[0].index('-archivePath')+1],str(stale));self.assertEqual((stale/'Info.plist').read_bytes(),b'stale');self.assertTrue(Path(result['evidence']['artifact']['path']).is_file())
+    def test_archive_wrong_output_refused_before_execution(self):
+        (self.checkout/'App.xcodeproj').mkdir()
+        target=dict(self.target,kind='ios',project='App.xcodeproj',scheme='App',archive_path=str(self.root/'B.xcarchive'),archive_argv=['xcodebuild','-project','App.xcodeproj','-scheme','App','-archivePath',str(self.root/'A.xcarchive'),'archive'])
+        with patch.object(a,'_repository',return_value=(self.checkout,'fixture/app')), patch.object(a,'_run') as run:
+            with self.assertRaises(WorkbenchError):a.execute_action('archive',self.product,self.root,target,self.candidate,{'archive_suffix':'intent-1'})
+            run.assert_not_called()
+    def test_archive_project_outside_candidate_refused(self):
+        target=dict(self.target,kind='ios',project='/unrelated/App.xcodeproj',scheme='App',archive_path=str(self.root/'B.xcarchive'),archive_argv=['xcodebuild','-project','/unrelated/App.xcodeproj','-scheme','App','-archivePath',str(self.root/'B.xcarchive'),'archive'])
+        with patch.object(a,'_repository',return_value=(self.checkout,'fixture/app')), patch.object(a,'_run') as run:
+            with self.assertRaises(WorkbenchError):a.execute_action('archive',self.product,self.root,target,self.candidate,{'archive_suffix':'intent-1'})
+            run.assert_not_called()
+    def test_smoke_unknown_intent_reconciles_only_candidate_active(self):
+        def remote(*args):
+            if args[0].endswith('/versions'):return {'result':{'items':[{'id':'version','annotations':{'workers/message':'AppWorkbench candidate '+self.commit}}]}}
+            return {'result':{'deployments':[{'id':'deployment','versions':[{'version_id':'version','percentage':100}]}]}}
+        with patch.object(a,'_cf_auth',return_value=('fake','https://fixture.invalid')), patch.object(a,'_json_api',side_effect=remote), patch.object(a,'execute_action',return_value={'status':'succeeded','evidence':{'http_status':200}}):
+            result=a._reconcile(self.product,self.root,self.target,self.candidate,{'original_action':'smoke'});self.assertTrue(result['authenticated']);self.assertEqual(result['status'],'succeeded')
+    def test_original_action_takes_precedence_over_parameter_override(self):
+        with patch.object(a,'_worker_versions',return_value=[]),patch.object(a,'_cf_auth') as auth:
+            result=a._reconcile(self.product,self.root,self.target,self.candidate,{'original_action':'deploy','action':'rollback','version_id':'old'})
+        self.assertEqual(result['status'],'unverified');auth.assert_not_called()
     def test_actual_git_and_check(self):
         result = a.execute_action("check", self.product, self.root, self.target, self.candidate, {"check": "actual"})
         self.assertEqual(result["status"], "succeeded")
@@ -245,6 +281,12 @@ class AdapterTests(unittest.TestCase):
             result = a.execute_action("deploy", self.product, self.root, target, self.candidate, {"deployment_preflight": recorded})
         self.assertEqual(result["status"], "unverified")
         dispatch.assert_not_called()
+
+    def test_inspection_missing_executable_is_blocked(self):
+        with patch.object(a.shutil, "which", return_value=None):
+            checks = a.inspect_product(self.product, self.root)
+        self.assertEqual(next(row for row in checks if row["capability"] == "check")["status"], "blocked")
+        self.assertEqual(next(row for row in checks if row["capability"] == "deploy")["status"], "blocked")
 
 
 if __name__ == "__main__":

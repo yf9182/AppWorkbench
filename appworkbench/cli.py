@@ -44,7 +44,7 @@ def parser():
     evidence.add_argument('id'); evidence.add_argument('--file', required=True); evidence.add_argument('--source', required=True); evidence.add_argument('--binding', help='JSON file with commit/version/source binding')
     export = sub.add_parser('export'); export.add_argument('--output', required=True)
     backup = sub.add_parser('backup'); backup.add_argument('--output', required=True); backup.add_argument('--key-file', required=True)
-    restore = sub.add_parser('restore'); restore.add_argument('--input', required=True); restore.add_argument('--key-file', required=True); restore.add_argument('--destination', required=True)
+    restore = sub.add_parser('restore'); restore.add_argument('--input', required=True); restore.add_argument('--key-file', required=True); restore.add_argument('--destination', required=True); restore.add_argument('--credential-home', help='A separately restored private credential-center directory to merge without its products/state')
     serve = sub.add_parser('serve'); serve.add_argument('--host', default='127.0.0.1'); serve.add_argument('--port', type=int, default=8765)
     return p
 
@@ -52,7 +52,7 @@ def dispatch(args):
     # Restoration must not create the destination (or the default state) before validation.
     if args.command == 'restore':
         from .migration import restore
-        return restore(args.input, args.key_file, args.destination)
+        return restore(args.input, args.key_file, args.destination, args.credential_home)
     root = Path(args.home).expanduser()
     if root.is_symlink():
         raise WorkbenchError('unsafe_path', 'Workbench home cannot be a symlink')

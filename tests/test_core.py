@@ -75,6 +75,35 @@ class Core(unittest.TestCase):
         self.gated();self.deliver('pr');self.deliver('merge');self.deliver('deploy');self.deliver('smoke')
         value={'actor':'human-yf','message':'Core path works on deployed version','target':'web','commit':self.sha,'status':'passed','checks':{'core_path':'passed'}}
         self.error('acceptance_mismatch',self.engine.accept,self.run,{**value,'commit':'a'*40});self.error('human_acceptance_required',self.engine.accept,self.run,{**value,'actor':'codex'});self.assertEqual(self.engine.accept(self.run,value)['phase'],'accepted')
+    def test_crashed_intent_without_outcome_can_reconcile_and_deduplicate(self):
+        self.gated();self.transport.outcomes[('pr','web')]=TimeoutError();item=self.deliver('pr')
+        item.pop('evidence');item.pop('outcome');item['status']='running';item['pid']=99999999
+        with self.engine.store.transaction():self.engine.store.put_action(item)
+        completed=self.engine.reconcile(self.run,item['id']);self.assertEqual(completed['status'],'succeeded');self.assertTrue(self.deliver('pr')['deduplicated'])
+    def test_reconciliation_evidence_is_verified_before_merge(self):
+        self.gated();self.transport.outcomes[('pr','web')]=TimeoutError();item=self.deliver('pr');completed=self.engine.reconcile(self.run,item['id']);(self.root/completed['reconciliation_evidence']['path']).write_text('tampered');self.error('evidence_changed',self.deliver,'merge')
+    def test_accepted_old_iteration_cannot_execute_with_new_owner(self):
+        self.gated();self.deliver('pr');self.deliver('merge');self.deliver('deploy');self.deliver('smoke');self.engine.accept(self.run,{'actor':'human-yf','message':'Tested','target':'web','commit':self.sha,'status':'passed','checks':{'core_path':'passed'}})
+        other=self.engine.create('product',self.plan)['id'];self.engine.approve(other,'human-yf','Execute new plan');self.error('iteration_complete',self.engine.candidate,self.run,self.value)
+    def test_recovery_fields_cannot_override_intent(self):
+        self.gated();self.error('parameters_reserved',self.engine.deliver,self.run,'web','pr',{'action':'rollback'})
+    def test_completed_delivery_cannot_satisfy_a_revised_configuration(self):
+        self.gated();self.deliver('pr');self.deliver('merge');self.deliver('deploy');self.deliver('smoke')
+        product=copy.deepcopy(self.product);product['workflow']['targets'][0]['smoke_url']='https://different.invalid/';self.engine.registry.register(product)
+        self.engine.revise(self.run,self.plan);self.engine.approve(self.run,'human-yf','Execute revised plan');self.engine.candidate(self.run,self.value)
+        self.engine.review(self.run,{'repository':'Repo','commit':self.sha,'reviewer':'independent','status':'passed'});self.engine.check(self.run,'web')
+        self.assertFalse(self.engine._delivered(self.engine.store.get(self.run),product['workflow']['targets'][0]));self.error('merge_required',self.deliver,'deploy');self.error('prior_revision_action',self.deliver,'pr')
+    def test_artifact_addition_preserves_commit_tests_and_review(self):
+        self.gated();ipa=self.base/'package.ipa';ipa.write_bytes(b'signed-archive-fixture');self.engine.candidate(self.run,{**self.value,'artifact':{'path':str(ipa),'sha256':sha256_file(ipa)}})
+        value=self.engine.status(self.run);self.assertEqual(value['reviews']['Repo']['status'],'passed');self.assertEqual(value['checks']['web']['tests']['status'],'passed')
+    def test_multirepository_partial_delivery_and_compatibility(self):
+        other=self.base/'Frontend';subprocess.run(['git','clone','-q',str(self.repo),str(other)],check=True,capture_output=True);subprocess.run(['git','-C',str(other),'remote','set-url','origin','https://github.com/owner/Frontend.git'],check=True,capture_output=True)
+        product=copy.deepcopy(self.product);product['repositories'].append({'owner':'owner','name':'Frontend','local_path':str(other)});back=product['workflow']['targets'][0];back.update(id='backend',kind='worker',compatibility_required=True);web=copy.deepcopy(back);web.update(id='frontend',kind='web',repository='Frontend',depends_on=['backend'],compatibility_required=False);product['workflow']['targets'].append(web);self.engine.registry.register(product);self.engine.revise(self.run,self.plan,['backend','frontend']);self.engine.approve(self.run,'human-yf','Execute multi repository plan')
+        compatibility=self.base/'compat.md';compatibility.write_text('Actual test fixture describes old-client compatibility');ref=self.engine.evidence(self.run,compatibility,'compatibility',{'commit':self.sha});value={**self.value,'compatibility':{'old_clients_supported':True,'evidence':ref['id']}};self.engine.candidate(self.run,value);self.engine.candidate(self.run,{'repository':'Frontend','commit':self.sha,'local_path':str(other),'author':'implementer'})
+        for repo,target in [('Repo','backend'),('Frontend','frontend')]:self.engine.review(self.run,{'repository':repo,'commit':self.sha,'reviewer':'reviewer','status':'passed'});self.engine.check(self.run,target)
+        self.engine.deliver(self.run,'frontend','pr');self.error('dependency_pending',self.engine.deliver,self.run,'frontend','merge')
+        for action in ['pr','merge','deploy','smoke']:self.engine.deliver(self.run,'backend',action)
+        self.engine.deliver(self.run,'frontend','merge');self.transport.outcomes[('deploy','frontend')]=TimeoutError();item=self.engine.deliver(self.run,'frontend','deploy');self.assertEqual(item['status'],'uncertain');self.assertTrue(self.engine._delivered(self.engine.store.get(self.run),back));self.assertFalse(self.engine._delivered(self.engine.store.get(self.run),web));self.engine.reconcile(self.run,item['id']);self.engine.deliver(self.run,'frontend','smoke');self.assertTrue(self.engine._delivered(self.engine.store.get(self.run),web))
     def test_no_store_submission(self):self.error('action_forbidden',self.deliver,'submit')
     def test_missing_revenue_is_unknown_and_collection_partial(self):
         data=self.engine.collect('product');self.assertIsNone(data['sources'][0]['data']);self.assertEqual(data['sources'][1]['status'],'succeeded')

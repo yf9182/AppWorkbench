@@ -868,7 +868,8 @@ def _store_spec(parameters):
     expected = []
     for row in locales:
         locale = row.get("locale")
-        if not isinstance(locale, str) or not locale or not row.get("screenshots"):
+        legacy = bool(parameters.get("legacy_candidate_file"))
+        if not isinstance(locale, str) or not locale or (not row.get("screenshots") and not legacy):
             raise WorkbenchError("configuration", "Every reviewed locale needs existing screenshot specifications")
         screenshots = []
         for image in row["screenshots"]:
@@ -879,10 +880,11 @@ def _store_spec(parameters):
                 raise WorkbenchError("artifact", "Screenshot file, display type and reviewed SHA256 are required")
             checksum = hashlib.md5(file.read_bytes()).hexdigest()
             screenshots.append({"display_type": image["display_type"], "checksum": checksum,
-                                "sha256": image["sha256"], "file_size": file.stat().st_size})
+                                "sha256": image["sha256"], "file_size": file.stat().st_size,
+                                "legacy_filename": image["sha256"] + file.suffix.lower() if legacy else None})
         expected.append({"locale": locale, "attributes": {k: v for k, v in row.items() if k in
                         {"description", "keywords", "marketingUrl", "promotionalText", "supportUrl", "whatsNew"}},
-                         "screenshots": screenshots})
+                         "screenshots": screenshots, "legacy_append": legacy})
     return expected, digest
 
 
@@ -916,7 +918,8 @@ def _store_verify(token, target, candidate, spec, digest):
         if len(matched) != 1 or any(matched[0].get("attributes", {}).get(key) != value for key, value in expected["attributes"].items()):
             return {"status": "unverified", "authenticated": True, "reason": "Remote localization differs from reviewed metadata"}
         locale = matched[0]
-        sets = _json_api(base + "/appStoreVersionLocalizations/" + locale["id"] + "/appScreenshotSets", token).get("data", [])
+        sets = (_json_api(base + "/appStoreVersionLocalizations/" + locale["id"] + "/appScreenshotSets", token).get("data", [])
+                if expected["screenshots"] else [])
         locale_evidence = []
         for display_type in sorted({image["display_type"] for image in expected["screenshots"]}):
             wanted = [image for image in expected["screenshots"] if image["display_type"] == display_type]
@@ -925,6 +928,16 @@ def _store_verify(token, target, candidate, spec, digest):
                 return {"status": "unverified", "authenticated": True, "reason": "Reviewed screenshot display set not found uniquely"}
             images = _json_api(base + "/appScreenshotSets/" + found[0]["id"] + "/appScreenshots", token).get("data", [])
             actual = [row.get("attributes", {}) for row in images]
+            if expected.get("legacy_append"):
+                # The legacy uploader appends content-addressed reservations and
+                # preserves existing screenshots. Verify each requested asset;
+                # a metadata-only operation makes no screenshot claim.
+                selected = [[row for row in images if row.get("attributes", {}).get("fileName") == image["legacy_filename"]]
+                            for image in wanted]
+                if any(len(rows) != 1 for rows in selected):
+                    return {"status": "unverified", "authenticated": True, "reason": "Legacy screenshot reservation not found uniquely"}
+                images = [rows[0] for rows in selected]
+                actual = [row.get("attributes", {}) for row in images]
             # Ordered, complete set equality prevents extra stale/unreviewed screenshots.
             if (len(actual) != len(wanted) or any(
                     str(attrs.get("sourceFileChecksum") or "").lower() != image["checksum"]

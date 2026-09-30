@@ -38,6 +38,11 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual((dest/'state/workbench.sqlite').stat().st_mode & 0o777,0o600)
         self.assertEqual(dest.stat().st_mode & 0o777,0o700)
         with self.assertRaises(WorkbenchError): migration.restore(a,k,dest)
+    def test_restore_preserves_existing_parent_permissions(self):
+        a,k=self.pack(); parent=self.base/'shared';parent.mkdir(mode=0o755)
+        migration.restore(a,k,parent/'restored')
+        self.assertEqual(parent.stat().st_mode & 0o777,0o755)
+        self.assertEqual((parent/'restored').stat().st_mode & 0o777,0o700)
     def test_restore_can_merge_separate_credentials_without_overwriting_products(self):
         a,k=self.pack();credentials=self.base/'credentials';credentials.mkdir();(credentials/'secrets').mkdir();token=credentials/'secrets/provider.txt';token.write_text('test-value-for-private-transfer');token.chmod(0o600)
         write_json(credentials/'manifest.json',{'credentials':{'test':{'file':'secrets/provider.txt'}}});write_json(credentials/'products.json',{'products':[]})

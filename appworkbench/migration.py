@@ -150,7 +150,9 @@ def restore(input, key_file, destination, credential_home=None):
                 raise ValueError()
     except Exception:
         raise WorkbenchError('archive_invalid', 'Archive structure is invalid')
-    private_dir(destination.parent)
+    # Do not chmod an existing shared parent such as /private/tmp or Downloads.
+    # mkdtemp creates the actual private restore directory with mode 0700.
+    destination.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
     staging = Path(tempfile.mkdtemp(prefix='.wb-restore-', dir=destination.parent))
     try:
         for name, value in contents:

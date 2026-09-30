@@ -232,6 +232,38 @@ class AdapterTests(unittest.TestCase):
         self.assertTrue(result["authenticated"])
         self.assertEqual(result["evidence"]["state"], "awaiting_manual_submission")
 
+    def legacy_store_fixture(self, screenshots):
+        self.store_fixture()
+        image = self.root / "screen.png"
+        self.metadata.write_text(json.dumps({"metadata": {"en-US": {"description": "Reviewed description"}},
+            "screenshots": [{"locale": "en-US", "display_type": "APP_IPHONE_67", "file": {
+                "path": str(image), "sha256": a.sha256_file(image)}}] if screenshots else []}))
+        self.parameters.update(metadata_sha256=a.sha256_file(self.metadata), legacy_candidate_file=str(self.metadata))
+        self.spec, self.metadata_digest = a._store_spec(self.parameters)
+
+    def test_legacy_metadata_only_reconciles_without_screenshot_claim(self):
+        self.legacy_store_fixture(False)
+        def transport(url, *args, **kwargs):
+            self.assertNotIn("appScreenshot", url)
+            return self.store_api(url, *args, **kwargs)
+        with patch.object(a, "_builds", return_value=[self.store_build]), patch.object(a, "_json_api", side_effect=transport):
+            result = a._store_verify("fake", self.store_target, self.store_candidate, self.spec, self.metadata_digest)
+        self.assertEqual(result["status"], "succeeded")
+        self.assertEqual(result["evidence"]["localizations"][0]["screenshots"], [])
+
+    def test_legacy_append_checks_requested_asset_with_existing_screenshots(self):
+        self.legacy_store_fixture(True)
+        def transport(url, *args, **kwargs):
+            value = self.store_api(url, *args, **kwargs)
+            if url.endswith("/appScreenshots"):
+                value["data"][0]["attributes"]["fileName"] = self.spec[0]["screenshots"][0]["legacy_filename"]
+                value["data"].insert(0, {"id": "retained", "attributes": {"fileName": "old.png"}})
+            return value
+        with patch.object(a, "_builds", return_value=[self.store_build]), patch.object(a, "_json_api", side_effect=transport):
+            result = a._store_verify("fake", self.store_target, self.store_candidate, self.spec, self.metadata_digest)
+        self.assertEqual(result["status"], "succeeded")
+        self.assertEqual(result["evidence"]["localizations"][0]["screenshots"][0]["screenshot_ids"], ["image"])
+
     def test_store_screenshot_false_boolean_cannot_replace_byte_proof(self):
         self.store_fixture()
         original = self.store_api

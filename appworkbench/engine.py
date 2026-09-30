@@ -92,7 +92,7 @@ class Engine:
             raise WorkbenchError('plan_unapproved', 'This exact plan revision needs a real human confirmation')
         if sha256_file(confined(self.root, run['plan_path'])) != run['plan_sha256']:
             raise WorkbenchError('plan_changed', 'Approved plan document changed')
-        if run.get('phase') == 'accepted':
+        if run.get('phase') in {'accepted', 'awaiting_manual_submission'}:
             raise WorkbenchError('iteration_complete', 'Accepted iteration needs new actual defect feedback or a new plan before further implementation')
         owner = self.store.db.execute('SELECT run FROM owners WHERE product=?', (run['product'],)).fetchone()
         if not owner or owner[0] != run['id']:
@@ -187,6 +187,30 @@ class Engine:
                 raise WorkbenchError('artifact_changed', 'Candidate artifact is missing or changed')
         return repo
 
+    def _dependent_targets(self, product, repository):
+        targets = product.get('workflow', {}).get('targets', [])
+        affected = {t['id'] for t in targets if t['repository'] == repository}
+        while True:
+            expanded = affected | {t['id'] for t in targets if set(t.get('depends_on', [])) & affected}
+            if expanded == affected:return affected
+            affected = expanded
+
+    def _dependency_binding(self, run, product, repository=None, target_id=None):
+        targets = product.get('workflow', {}).get('targets', [])
+        selected = [t for t in targets if (repository and t['repository'] == repository) or t['id'] == target_id]
+        dependencies = set()
+        def visit(target):
+            for name in target.get('depends_on', []):
+                if name not in dependencies:
+                    dependencies.add(name);visit(self.registry.target(product, name))
+        for target in selected:visit(target)
+        value = {}
+        for name in sorted(dependencies):
+            target = self.registry.target(product, name)
+            candidate = run['candidates'].get(target['repository'])
+            value[name] = code_binding(candidate) if candidate else {'outside_scope': True, 'plan': run['plan_sha256']}
+        return digest(value)
+
     def candidate(self, run_id, value):
         scan_sensitive(value)
         if not re.fullmatch('[0-9a-f]{40}', value.get('commit', '')) or not value.get('author'):
@@ -197,6 +221,8 @@ class Engine:
             repo = self._workspace(product, value)
             if repo['name'] not in {self.registry.target(product, t)['repository'] for t in run['targets']}:
                 raise WorkbenchError('scope_mismatch', 'Repository is outside the confirmed plan targets')
+            if any(a.get('target_snapshot', {}).get('repository') == repo['name'] for a in self.store.unresolved()):
+                raise WorkbenchError('action_unresolved', 'Reconcile this repository previous intents before replacing its candidate')
             value = copy.deepcopy(value)
             value['repository'] = repo['name']
             old = run['candidates'].get(repo['name'])
@@ -204,10 +230,12 @@ class Engine:
                 changed_code = not old or code_binding(old) != code_binding(value)
                 if changed_code:
                     run['reviews'].pop(repo['name'], None)
+                affected = self._dependent_targets(product, repo['name']) if changed_code else {t['id'] for t in product['workflow']['targets'] if t['repository'] == repo['name']}
                 for target in product['workflow']['targets']:
-                    if target['repository'] == repo['name']:
+                    if target['id'] in affected:
                         if changed_code:
                             run['checks'].pop(target['id'], None)
+                            run['reviews'].pop(target['repository'], None)
                         run['acceptances'].pop(target['id'], None)
             run['candidates'][repo['name']] = value
             run['phase'] = 'implementing'
@@ -235,7 +263,7 @@ class Engine:
                 raise WorkbenchError('review_blocking_findings', 'Blocking findings cannot be recorded as passed')
             self._workspace(product, candidate)
             reference = self._evidence(run, 'independent_review', value=value, binding={'repository': repo['name'], 'commit': candidate['commit'], 'candidate_sha256': code_binding(candidate)})
-            run['reviews'][repo['name']] = {'status': status, 'reviewer': reviewer, 'commit': candidate['commit'], 'candidate_sha256': code_binding(candidate), 'evidence': reference}
+            run['reviews'][repo['name']] = {'status': status, 'reviewer': reviewer, 'commit': candidate['commit'], 'candidate_sha256': code_binding(candidate), 'dependency_sha256': self._dependency_binding(run, product, repository=repo['name']), 'evidence': reference}
             self.store.put(run)
             self.store.audit(run_id, 'review_recorded', {'repository': repo['name'], 'status': status, 'reviewer': reviewer})
         self.report(run_id)
@@ -264,7 +292,7 @@ class Engine:
                 with self.store.transaction():
                     run = self.store.get(run_id)
                     reference = self._evidence(run, 'check:' + check['id'], value=outcome, binding={'commit': candidate['commit'], 'target': target_id, 'candidate_sha256': code_binding(candidate)})
-                    record = {'name': check['id'], 'status': status, 'commit': candidate['commit'], 'candidate_sha256': code_binding(candidate), 'configuration_sha256': run['configuration_sha256'], 'evidence': reference}
+                    record = {'name': check['id'], 'status': status, 'commit': candidate['commit'], 'candidate_sha256': code_binding(candidate), 'configuration_sha256': run['configuration_sha256'], 'dependency_sha256': self._dependency_binding(run, product, target_id=target_id), 'evidence': reference}
                     run['checks'].setdefault(target_id, {})[check['id']] = record
                     self.store.put(run)
                     self.store.audit(run_id, 'check_completed', {'target': target_id, 'name': check['id'], 'status': status})
@@ -282,7 +310,7 @@ class Engine:
             raise WorkbenchError('candidate_missing', 'Target has no committed candidate')
         self._workspace(product, candidate)
         review = run['reviews'].get(target['repository'], {})
-        if review.get('status') != 'passed' or review.get('candidate_sha256') != code_binding(candidate):
+        if review.get('status') != 'passed' or review.get('candidate_sha256') != code_binding(candidate) or review.get('dependency_sha256') != self._dependency_binding(run, product, repository=target['repository']):
             raise WorkbenchError('review_required', 'Current candidate needs independent passing review')
         self._verify_evidence(review['evidence'])
         required = target.get('required_checks', [])
@@ -290,7 +318,7 @@ class Engine:
             raise WorkbenchError('checks_unconfigured', 'Release needs explicitly configured acceptance checks')
         for check_name in required:
             record = run['checks'].get(target['id'], {}).get(check_name, {})
-            if record.get('status') != 'passed' or record.get('candidate_sha256') != code_binding(candidate) or record.get('configuration_sha256') != run['configuration_sha256']:
+            if record.get('status') != 'passed' or record.get('candidate_sha256') != code_binding(candidate) or record.get('configuration_sha256') != run['configuration_sha256'] or record.get('dependency_sha256') != self._dependency_binding(run, product, target_id=target['id']):
                 raise WorkbenchError('check_required', 'Current candidate has missing or failed required checks')
             self._verify_evidence(record['evidence'])
         if target.get('compatibility_required'):
@@ -395,6 +423,9 @@ class Engine:
                     recorded = run['acceptances'].get(target_id, {}).get('metadata_sha256')
                     if not recorded or recorded != parameters.get('metadata_sha256'):
                         raise WorkbenchError('metadata_acceptance_required', 'The actual human metadata review must bind the exact metadata file digest')
+                unresolved = self.store.unresolved()
+                if any(a.get('target_snapshot', {}).get('account_id', '') + ':' + a.get('target_snapshot', {}).get('worker_name', a.get('target_snapshot', {}).get('app_id', a.get('target_snapshot', {}).get('repository', ''))) == resource for a in unresolved):
+                    raise WorkbenchError('action_uncertain', 'A previous intent on this target still needs reconciliation, even if its candidate changed')
                 item = existing or {'id': uuid.uuid4().hex, 'run': run_id, 'target': target_id, 'kind': action, 'dedup': key, 'created_at': now(), 'attempts': 0}
                 if action == 'archive':
                     parameters = {**parameters, 'archive_suffix': item['id'] + '-' + str(item['attempts'] + 1)}
@@ -416,6 +447,8 @@ class Engine:
                     item.update({'status': status, 'outcome': outcome, 'evidence': reference, 'finished_at': now()})
                     self.store.put_action(item)
                     run['phase'] = 'delivering' if status == 'succeeded' else 'delivery_attention'
+                    if action == 'prepare_store' and status == 'succeeded':
+                        self._finalize(run, product)
                     self.store.put(run)
                     self.store.audit(run_id, 'external_result', {'id': item['id'], 'status': status})
                 self.report(run_id)
@@ -486,25 +519,40 @@ class Engine:
             status = value.get('status')
             if status not in {'passed', 'issues', 'pending'}:
                 raise WorkbenchError('acceptance_invalid', 'Acceptance is passed, issues or pending')
-            if run.get('phase') == 'accepted' and status == 'issues':
+            if run.get('phase') in {'accepted', 'awaiting_manual_submission'} and status == 'issues':
                 self.store.claim(run)
             checks = {ACCEPTANCE_NAMES.get(k, k): v for k, v in value.get('checks', {}).items()}
             if status == 'passed':
+                self._approved(run)
+                self._gate(run, product, target, 'accept')
                 if not self._delivered(run, target):
                     raise WorkbenchError('delivery_pending', 'Human acceptance follows a recorded delivered target')
                 for name in target.get('human_acceptances', ['core_path']):
                     if checks.get(name) != 'passed':
                         raise WorkbenchError('human_checks_pending', 'Required human business checks are incomplete')
             reference = self._evidence(run, 'human_acceptance', value=value, binding={'target': target['id'], 'commit': candidate['commit'], 'candidate_sha256': digest(candidate)})
-            run['acceptances'][target['id']] = {'status': status, 'actor': actor, 'candidate_sha256': digest(candidate), 'checks': checks, 'metadata_sha256': value.get('metadata_sha256'), 'evidence': reference}
-            all_passed = bool(run['targets']) and all(run['acceptances'].get(t, {}).get('status') == 'passed' for t in run['targets'])
-            run['phase'] = 'accepted' if all_passed else 'feedback_pending'
+            run['acceptances'][target['id']] = {'status': status, 'actor': actor, 'candidate_sha256': digest(candidate), 'checks': checks, 'metadata_sha256': value.get('metadata_sha256'), 'dependency_sha256': self._dependency_binding(run, product, target_id=target['id']), 'evidence': reference}
+            self._finalize(run, product)
             self.store.put(run)
-            if all_passed:
-                self.store.db.execute('DELETE FROM owners WHERE product=? AND run=?', (run['product'], run_id))
             self.store.audit(run_id, 'human_feedback', {'target': target['id'], 'actor': actor, 'status': status})
         self.report(run_id)
         return self.status(run_id)
+
+    def _finalize(self, run, product):
+        all_passed = bool(run['targets']) and all(run['acceptances'].get(t, {}).get('status') == 'passed' and run['acceptances'][t].get('candidate_sha256') == digest(run['candidates'].get(self.registry.target(product, t)['repository'])) and run['acceptances'][t].get('dependency_sha256') == self._dependency_binding(run, product, target_id=t) for t in run['targets'])
+        if not all_passed:
+            run['phase'] = 'feedback_pending'
+            return
+        ios = [self.registry.target(product, t) for t in run['targets'] if self.registry.target(product, t)['kind'] == 'ios']
+        for target in ios:
+            candidate = run['candidates'][target['repository']]
+            prepared = [a for a in self.store.actions(run['id']) if a['target'] == target['id'] and a['kind'] == 'prepare_store' and a['status'] == 'succeeded' and a.get('candidate_sha256') == digest(candidate) and a.get('plan_sha256') == run['plan_sha256'] and a.get('configuration_sha256') == run['configuration_sha256']]
+            if not prepared:
+                run['phase'] = 'awaiting_store_preparation'
+                return
+            for action in prepared:self._action_evidence(action)
+        run['phase'] = 'awaiting_manual_submission' if ios else 'accepted'
+        self.store.db.execute('DELETE FROM owners WHERE product=? AND run=?', (run['product'], run['id']))
 
     def control(self, run_id, operation):
         with self.store.lock('iteration:' + run_id), self.store.transaction():

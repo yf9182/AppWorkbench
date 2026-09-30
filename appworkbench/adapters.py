@@ -684,9 +684,25 @@ def execute_action(action, product, root, target, candidate, parameters):
         if action == "upload_tf":
             return _upload_ipa(product, root, target, candidate, token)
         return _prepare_store(product, root, target, candidate, token, parameters)
-    saved = json.loads(Path(candidate_file).read_text())
+    from .security import read_json
+    saved = read_json(candidate_file)
     if saved.get("commit") != candidate["commit"] or Path(saved.get("checkout", "")).resolve() != path:
         raise WorkbenchError("identity", "Legacy candidate does not match current candidate")
+    expected = {"app_id": str(target.get("app_id")), "bundle_id": target.get("bundle_id"), "team_id": target.get("team_id"), "version": str(candidate.get("version")), "build": str(candidate.get("build"))}
+    if any(str(saved.get(k)) != str(v) for k,v in expected.items()):
+        raise WorkbenchError("identity", "Legacy candidate App, team, version and build must match the engine candidate")
+    artifact = candidate.get("artifact", {})
+    ipa = Path(saved.get("ipa", "/nonexistent"))
+    if (not artifact.get("sha256") or saved.get("ipa_sha256") != artifact["sha256"]
+            or not ipa.is_file() or ipa.is_symlink() or sha256_file(ipa) != artifact["sha256"]):
+        raise WorkbenchError("artifact", "Legacy IPA must match the actual engine archive artifact")
+    actual = _inspect_ipa(ipa)
+    if any(actual.get(k) != expected[k] for k in ("bundle_id", "team_id", "version", "build")):
+        raise WorkbenchError("identity", "Legacy IPA distribution signing or identity differs")
+    if action == "prepare_store":
+        if (Path(parameters.get("metadata_file", "/nonexistent")).resolve() != Path(candidate_file).resolve()
+                or parameters.get("metadata_sha256") != sha256_file(Path(candidate_file))):
+            raise WorkbenchError("artifact", "Legacy formal preparation requires human review of this exact candidate metadata document")
     legacy_config = json.loads((Path(home) / "config.yaml").read_text())
     if not (path / "scripts/ops.py").is_file() or not (path / "scripts/ops_release.py").is_file():
         raise WorkbenchError("configuration", "Candidate repository lacks the legacy release facility")

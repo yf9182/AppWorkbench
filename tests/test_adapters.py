@@ -69,6 +69,13 @@ class AdapterTests(unittest.TestCase):
         with patch.object(a,'_worker_versions',return_value=[]),patch.object(a,'_cf_auth') as auth:
             result=a._reconcile(self.product,self.root,self.target,self.candidate,{'original_action':'deploy','action':'rollback','version_id':'old'})
         self.assertEqual(result['status'],'unverified');auth.assert_not_called()
+    def test_legacy_ipa_identity_cannot_differ_from_engine_artifact(self):
+        saved=self.root/'legacy-candidate.json';saved.write_text(json.dumps({'commit':self.commit,'checkout':str(self.checkout),'app_id':'1','bundle_id':'com.fixture.App','team_id':'TEAM','version':'9.0','build':'99','ipa_sha256':'b'*64,'ipa':str(self.root/'other.ipa')}))
+        target=dict(self.target,kind='ios',app_id='1',bundle_id='com.fixture.App',team_id='TEAM',legacy_repository=str(self.checkout),legacy_ops_home=str(self.root/'legacy'))
+        candidate=dict(self.candidate,version='1.0',build='1',artifact={'path':str(self.root/'engine.ipa'),'sha256':'a'*64})
+        with patch.object(a,'_repository',return_value=(self.checkout,'fixture/app')),patch.object(a,'_apple_token',return_value=('fake',{})),patch.object(a,'_apple_identity'),patch.object(a,'_run') as run:
+            with self.assertRaises(WorkbenchError):a.execute_action('upload_tf',self.product,self.root,target,candidate,{'legacy_candidate_file':str(saved),'legacy_task_id':'task'})
+            run.assert_not_called()
     def test_actual_git_and_check(self):
         result = a.execute_action("check", self.product, self.root, self.target, self.candidate, {"check": "actual"})
         self.assertEqual(result["status"], "succeeded")

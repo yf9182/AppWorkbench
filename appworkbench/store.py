@@ -94,6 +94,9 @@ class Store:
     def actions(self, run_id):
         return [json.loads(row[0]) for row in self.db.execute('SELECT record FROM actions WHERE run=?', (run_id,))]
 
+    def unresolved(self):
+        return [json.loads(row[0]) for row in self.db.execute("SELECT record FROM actions WHERE status IN ('running','uncertain')")]
+
     def find_action(self, key):
         row = self.db.execute('SELECT record FROM actions WHERE dedup=?', (key,)).fetchone()
         return json.loads(row[0]) if row else None

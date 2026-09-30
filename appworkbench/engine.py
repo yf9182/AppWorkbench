@@ -410,6 +410,12 @@ class Engine:
                     if existing.get('configuration_sha256') != run['configuration_sha256'] or existing.get('plan_sha256') != run['plan_sha256']:
                         raise WorkbenchError('prior_revision_action', 'Historical delivery is bound to a different configuration or plan; use a new candidate or explicitly verify the earlier iteration')
                     self._action_evidence(existing)
+                    if action == 'prepare_store':
+                        with self.store.transaction():
+                            self._finalize(run, product)
+                            self.store.put(run)
+                            self.store.audit(run_id, 'delivery_recovery_finalized', {'action': existing['id']})
+                        self.report(run_id)
                     return {**existing, 'deduplicated': True}
                 if existing and existing['status'] in {'running', 'uncertain'}:
                     raise WorkbenchError('action_uncertain', 'Reconcile the previous intent remotely before another dispatch')
@@ -468,6 +474,12 @@ class Engine:
             if item['run'] != run_id:
                 raise WorkbenchError('scope_mismatch', 'Action belongs to another iteration')
             if item['status'] not in {'uncertain', 'running'}:
+                if item['kind'] == 'prepare_store' and item['status'] == 'succeeded':
+                    self._action_evidence(item)
+                    with self.store.transaction():
+                        self._finalize(run, self.registry.get(run['product']))
+                        self.store.put(run)
+                    self.report(run_id)
                 return item
             if item['status'] == 'running' and item.get('pid') != os.getpid():
                 try:
@@ -488,6 +500,9 @@ class Engine:
                     item['evidence'] = reference
                 item.update({'status': outcome['status'], 'reconciliation': outcome, 'reconciliation_evidence': reference, 'reconciled_at': now()})
                 self.store.put_action(item)
+                if item['status'] == 'succeeded':
+                    run['phase'] = 'delivering'
+                    if item['kind'] == 'prepare_store':self._finalize(run, product)
                 self.store.put(run)
                 self.store.audit(run_id, 'external_reconciled', {'id': action_id, 'status': item['status']})
             self.report(run_id)
@@ -539,6 +554,9 @@ class Engine:
         return self.status(run_id)
 
     def _finalize(self, run, product):
+        if configuration_digest(self.registry.get(run['product'])) != run['configuration_sha256']:
+            run['phase'] = 'configuration_attention'
+            return
         all_passed = bool(run['targets']) and all(run['acceptances'].get(t, {}).get('status') == 'passed' and run['acceptances'][t].get('candidate_sha256') == digest(run['candidates'].get(self.registry.target(product, t)['repository'])) and run['acceptances'][t].get('dependency_sha256') == self._dependency_binding(run, product, target_id=t) for t in run['targets'])
         if not all_passed:
             run['phase'] = 'feedback_pending'

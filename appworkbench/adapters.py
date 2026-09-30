@@ -848,7 +848,21 @@ def _store_spec(parameters):
         raise WorkbenchError("artifact", "Store metadata must match its reviewed SHA256")
     data = json.loads(metadata.read_text())
     scan_sensitive(data)
-    locales = data.get("localizations", [])
+    if parameters.get("legacy_candidate_file"):
+        if Path(parameters["legacy_candidate_file"]).resolve() != metadata.resolve() or not isinstance(data.get("metadata"), dict):
+            raise WorkbenchError("identity", "Legacy metadata must be its exact reviewed candidate document")
+        locales = []
+        for locale, attributes in data["metadata"].items():
+            screenshots = []
+            for image in data.get("screenshots", []):
+                if image.get("locale") != locale:continue
+                reference = image.get("file", {})
+                if not isinstance(reference, dict):
+                    raise WorkbenchError("artifact", "Legacy screenshot needs its actual file reference")
+                screenshots.append({"file": reference.get("path"), "sha256": reference.get("sha256"), "display_type": image.get("display_type")})
+            locales.append({"locale": locale, **attributes, "screenshots": screenshots})
+    else:
+        locales = data.get("localizations", [])
     if not isinstance(locales, list) or not locales or len({row.get("locale") for row in locales}) != len(locales):
         raise WorkbenchError("configuration", "Store metadata needs unique localizations")
     expected = []

@@ -76,6 +76,13 @@ class AdapterTests(unittest.TestCase):
         with patch.object(a,'_repository',return_value=(self.checkout,'fixture/app')),patch.object(a,'_apple_token',return_value=('fake',{})),patch.object(a,'_apple_identity'),patch.object(a,'_run') as run:
             with self.assertRaises(WorkbenchError):a.execute_action('upload_tf',self.product,self.root,target,candidate,{'legacy_candidate_file':str(saved),'legacy_task_id':'task'})
             run.assert_not_called()
+    def test_legacy_formal_preparation_reconcile_uses_legacy_schema(self):
+        import hashlib
+        screenshot=self.root/'screen.png';screenshot.write_bytes(b'reviewed-screenshot-fixture');metadata=self.root/'candidate.json';metadata.write_text(json.dumps({'schema':1,'metadata':{'en-US':{'description':'Reviewed description'}},'screenshots':[{'locale':'en-US','display_type':'APP_IPHONE_65','file':{'path':str(screenshot),'sha256':hashlib.sha256(screenshot.read_bytes()).hexdigest()}}]}))
+        parameters={'original_action':'prepare_store','metadata_file':str(metadata),'metadata_sha256':a.sha256_file(metadata),'legacy_candidate_file':str(metadata)}
+        with patch.object(a,'_apple_token',return_value=('fake',{})),patch.object(a,'_apple_identity'),patch.object(a,'_store_verify',return_value={'status':'succeeded','authenticated':True}) as verify:
+            result=a._reconcile(self.product,self.root,dict(self.target,app_id='1',bundle_id='com.fixture.App'),self.candidate,parameters)
+        self.assertEqual(result['status'],'succeeded');self.assertEqual(verify.call_args.args[3][0]['attributes']['description'],'Reviewed description');self.assertEqual(verify.call_args.args[3][0]['screenshots'][0]['sha256'],hashlib.sha256(screenshot.read_bytes()).hexdigest())
     def test_actual_git_and_check(self):
         result = a.execute_action("check", self.product, self.root, self.target, self.candidate, {"check": "actual"})
         self.assertEqual(result["status"], "succeeded")

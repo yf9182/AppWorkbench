@@ -1,5 +1,6 @@
 {
   "actor": "actual-human-id",
+  "metadata_sha256": "replace-with-reviewed-metadata-digest-before-formal-preparation",
   "target": "actual-target-id",
   "version": "actual-tested-version",
   "build": "actual-tested-build",

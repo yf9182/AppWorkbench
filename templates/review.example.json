@@ -1,0 +1,8 @@
+{
+  "reviewer": "actual-independent-reviewer-id",
+  "repository": "owner/repository",
+  "commit": "replace-with-real-full-commit",
+  "status": "unverified",
+  "findings": [],
+  "evidence": "replace-with-actual-review-evidence-reference"
+}

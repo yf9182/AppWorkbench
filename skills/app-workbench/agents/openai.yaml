@@ -1,0 +1,6 @@
+interface:
+  display_name: "AppWorkbench 产品迭代"
+  short_description: "调查 App 与网站，规划版本并交付经确认的多仓库迭代和验收证据"
+  default_prompt: "使用 $app-workbench 看看 AI Pet Studio 最近的情况，推荐一个有依据的版本计划。"
+policy:
+  allow_implicit_invocation: true
